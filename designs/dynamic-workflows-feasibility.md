@@ -127,7 +127,8 @@ The API surface relevant to orchestration (from `openapi.json`):
   public create takes an agent bundle + metadata (title/labels/effort/workspace);
   it does **not** expose a `parent_session_id`. Parenting a session into the
   orchestrator's tree is done today by the *internal* `sys_session_send` /
-  `sys_session_create` tools, not this endpoint — see the confidence note in §7.
+  `sys_session_create` tools, not this endpoint — see §7 for the two options
+  (broker vs. a parent-aware create) and §8 for the confidence note.
 - `GET /v1/sessions/{id}/child_sessions` (read the sub-agent tree; the SDK's
   `child_sessions_tree` / `subtree_busy` are built "for an SDK driver") and
   `POST /v1/sessions/{source}/fork` (deep-copy a session's history into a new
@@ -319,7 +320,183 @@ a thin workflow wrapper + `/command` surface, and per-run caps.
 
 ---
 
-## 7. Confidence and what remains unverified
+## 7. Tying child sessions to the orchestrator (parenting): two options
+
+A deterministic workflow program (§2.5 / Approach B) can create and drive agent
+sessions today, but those sessions are **top-level** — they do not appear nested
+under the orchestrator in the UI tree. This section documents, in full, the two
+ways to make spawned sessions show up as children of the orchestrator, the
+tradeoffs of each, and a third "don't bother" fallback.
+
+### The mechanic that governs all of this
+
+The sub-agent tree is **derived purely from two stored fields** on a conversation:
+`kind == "sub_agent"` and `parent_conversation_id == <orchestrator id>`. At create
+time the store sets `kind = "sub_agent" if parent_conversation_id else "default"`
+(`omnigent/stores/conversation_store/sqlalchemy_store.py:174`), and
+`GET /v1/sessions/{id}/child_sessions` is just a query over those two fields. Two
+consequences:
+
+1. **If** a session carries the orchestrator's id as its `parent_conversation_id`
+   (and `kind="sub_agent"`), it **automatically** appears in the tree. There is no
+   separate "register child" step — the tree is a view over the field.
+2. **`parent_conversation_id` is set only at creation and is immutable
+   thereafter.** The only mutator, `update_conversation`, accepts `title,
+   reasoning_effort, model_override, cost_control_mode_override, harness_override,
+   terminal_launch_args, archived` — **no parent field** — and there is no
+   `reparent` / `set_parent` method. The public `PATCH /v1/sessions/{id}` likewise
+   exposes only `runner_id, reasoning_effort, model_override, archived,
+   external_session_id`. So "adopt an existing top-level session by id" is **not
+   possible** without a code change (this rules out the re-parenting idea explored
+   earlier). A `(parent_conversation_id, title)` unique index and a parent-exists
+   check are enforced at create; any new write path must honor both.
+
+The internal `sys_session_create` / `sys_session_send` tools **do** accept
+`parent_conversation_id`, so they are the one existing way to mint a
+already-parented child. There is also a clean capability split worth naming:
+**`sys_session_create` provisions an idle parented session (no turn started);
+`post_event` / send drives it.** Both options below rely on that split to avoid two
+drivers racing on one child.
+
+---
+
+### Option 1 — Broker pattern: the orchestrator provisions, the program drives
+
+The program never creates parented children itself. When it needs one, it asks the
+orchestrator (the LLM agent, which *does* hold the `sys_session_create` capability)
+to provision it.
+
+**Mechanism:**
+
+1. Program → `post_event` a request to the **orchestrator** session ("provision
+   parented child sessions for tasks A/B/C; do not drive them").
+2. Orchestrator's LLM calls `sys_session_create` once per child (parented,
+   create-only).
+3. Program reads the new ids back via `GET /v1/sessions/{orchestrator}/items`.
+   Critically, it does **not** parse prose: the `sys_session_create` tool-output is
+   a **structured JSON item** (`{task_id, kind:"sub_agent", agent, title,
+   conversation_id, status, message}` — the `_AsyncToolHandle` shape), so the
+   program extracts `conversation_id` deterministically from the function-call
+   output item.
+4. Program drives each child via public `post_event` + `stream`, holds all state in
+   its own variables, runs the workflow, and posts the final result back.
+
+**The decisive tradeoff — granularity.** Every callback to the orchestrator puts a
+nondeterministic LLM turn on the program's hot path (an LLM is a chat partner, not
+an RPC endpoint: loose timing, may batch/rephrase/do something else first).
+
+- **Front-loaded provisioning (acceptable):** the orchestrator provisions the whole
+  pool (or a phase's worth) in *one* request and returns all ids. LLM involvement
+  is bounded to setup; the program then runs deterministically. Fine for workflows
+  with known or phased fan-out.
+- **Per-spawn callbacks (anti-pattern):** asking the orchestrator to mint a child
+  every time the program fans out re-introduces exactly the LLM-in-the-loop latency
+  and nondeterminism that dynamic workflows exist to remove.
+
+**Why it grates conceptually.** The program is the party that knows *precisely*
+what it wants (a row with `parent_conversation_id = X`, a title, an agent) — it has
+everything. Routing that through the LLM reduces the most precise actor in the
+system to *describing* a mechanical action for a fuzzy actor to perform, then
+reading back to confirm it. It spends the LLM on the one step that contains **zero
+judgment**. The principle this violates: **the LLM belongs on judgment (what to
+spawn, how to decompose, whether a result is good enough); deterministic code
+belongs on mechanics (the create call).** "Create a child parented to X" is pure
+mechanics.
+
+**Pros:** zero core changes; works today; parented tree for free; the
+create/drive split keeps the contract clean (orchestrator creates, never drives).
+
+**Cons:** the orchestrator is a synchronous dependency in the program's path; the
+program must poll-with-timeout on the items API for the ids; reliability is bounded
+by LLM reliability as a provisioner; only sound when provisioning is front-loaded.
+
+**Verdict:** defensible **only** as a zero-core-change interim, and **only** for
+front-loaded provisioning.
+
+---
+
+### Option 2 — Give the deterministic program the capability directly (recommended target)
+
+Make a parented session something the program itself can create, so it never routes
+mechanics through the LLM. This is the principled answer and it is a **small,
+well-scoped change**.
+
+**Two equivalent shapes** (pick one):
+
+- **(a) Writable parent on update** — add `parent_conversation_id` to
+  `update_conversation` (and flip `kind` to `"sub_agent"` when it is set), then
+  expose it on `PATCH /v1/sessions/{id}` and the SDK. This also enables true
+  **adoption** of an existing top-level session by id.
+- **(b) Parent on create** — add a `parent_session_id` parameter to the create
+  path (`POST /v1/sessions` + `SessionsNamespace.create`), wiring it straight to
+  the store's existing `create_*_conversation(parent_conversation_id=…)` argument,
+  which already takes it.
+
+**Reuse existing validation.** Both shapes must honor what create already enforces:
+the parent must exist, and `(parent_conversation_id, title)` is unique. That logic
+exists in the store create path and is liftable.
+
+**The tree falls out for free.** Because `child_sessions` is just a query over
+`(kind, parent_conversation_id)`, once the field is writable the spawned (or
+adopted) session appears under the orchestrator with no further work.
+
+**Pros:** the program ties its own shoes — fully deterministic, no LLM round-trip
+for mechanics; clean separation (orchestrator's only job is the genuinely-LLM part:
+deciding to launch the workflow and judging the result); supports unbounded /
+dynamic fan-out; shape (a) also unlocks adoption/re-parenting.
+
+**Cons:** requires a core change (store + route + SDK), though a modest one
+(roughly: one field through `update_conversation`/create, one PATCH/create field,
+one SDK kwarg, plus the lifted validation); must keep the per-spawn cost under the
+same `spawn_bounds`-style caps so a deterministic loop cannot run away.
+
+**Verdict:** the principled, faithful target. Pairs naturally with Approach B.
+
+---
+
+### Option 3 — Don't parent at all (fallback)
+
+Drive top-level sessions from the program and skip UI nesting. Works today with
+zero changes; the cost is purely cosmetic (no sub-agent tree view, weaker
+observability of a run from the web UI). Reasonable for a v1 proof-of-concept where
+the deliverable is the synthesized result, not the live tree.
+
+---
+
+### Comparison
+
+| | Option 1 (broker) | Option 2 (capability) | Option 3 (flat) |
+|---|---|---|---|
+| Core changes | none | small (store+route+SDK) | none |
+| Parented tree (UI) | ✅ | ✅ | ❌ |
+| Fully deterministic run | only if provisioning front-loaded | ✅ | ✅ |
+| Supports unbounded dynamic fan-out | ❌ (LLM bottleneck) | ✅ | ✅ |
+| Enables adoption by id | ❌ | ✅ (shape a) | n/a |
+| LLM used for | judgment **and** spawn mechanics | judgment only | judgment only |
+| Good for | zero-change interim, front-loaded fan-out | the real feature | v1 PoC |
+
+### Recommendation for parenting
+
+Target **Option 2 (a parent-aware create / writable parent)** — it is the clean
+expression of "orchestrator orchestrates, deterministic program runs the workflow,"
+and the tree comes for free. Use **Option 1** only as a no-core-change interim and
+only when provisioning is front-loaded into a single orchestrator request. Use
+**Option 3** for the first proof-of-concept, where the synthesized answer is the
+deliverable and the tree view can wait.
+
+### Items to verify for both options
+
+1. **Owner-creds posting to children.** The program (with the user's token) posting
+   `post_event` to sessions owned by the same user *should* be permitted — the
+   public events route is ownership-gated, not parent-gated — but this was not
+   confirmed against the permission checks in the route code.
+2. **(Option 1 only) Orchestrator reliability as a provisioner.** "Create exactly
+   these N and report ids" needs explicit instructions, and the program should
+   poll-with-timeout on the items API rather than assume instant completion.
+
+---
+
+## 8. Confidence and what remains unverified
 
 This investigation is **static** — based on reading code and docs on this branch.
 **Nothing here was executed** (no live server, no run script). That is the single
