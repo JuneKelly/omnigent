@@ -5,11 +5,16 @@ Author: investigation spike
 Question asked: *Is it possible to replicate Claude Code's "dynamic workflows" in
 Omnigent?*
 
-**Short answer: yes, and most of the runtime substrate already exists.** The
-hard part is not the fan-out of parallel agents (Omnigent already does that); it
-is moving *the plan itself into code* — a deterministic, resumable orchestration
-script that holds the loop and the intermediate results outside any LLM context.
-That is a net-new primitive, but it composes cleanly with what Omnigent has.
+**Short answer: yes — and more cheaply than first expected.** The fan-out of
+parallel agents already exists. The defining property — moving *the plan itself
+into code*, a deterministic orchestration script that holds the loop and
+intermediate results outside any LLM context — initially looks net-new, but
+Omnigent already ships a **full HTTP/SSE API and a typed Python client SDK
+(`omnigent_client`)**. So the orchestration script is a *usage pattern over
+existing infrastructure*, not a new runtime: a deterministic Python program can
+create sub-agent sessions, fan turns out to them in parallel, hold every result
+in its own variables, and return only the final answer. See §2.5 — this is
+exactly the design the user proposed, and it's the recommended path.
 
 ---
 
@@ -100,13 +105,78 @@ The substrate that a workflow runtime would build on is already there:
   handles the messy edge case dynamic workflows call out (an agent blocked on a
   permission prompt mid-run) by escalating to the parent.
 
-The one thing Omnigent does **not** have: a way to express the orchestration as
-**deterministic code that runs outside an LLM context**. Today every
-"orchestrator" is itself an LLM agent (Polly's brain is a `claude-sdk` agent).
-There is no `.omnigent/workflows/` script concept, no non-LLM runtime that holds
-the plan, and no `ultracode`-style trigger. (Note: the `ucode` /
-`UcodeAgentState` symbols in the codebase are unrelated — that is Databricks
-workspace config, not Claude's `ultracode`.)
+The one thing Omnigent does **not** ship as a feature: a way to express the
+orchestration as **deterministic code that runs outside an LLM context**. Today
+every "orchestrator" is itself an LLM agent (Polly's brain is a `claude-sdk`
+agent). There is no `.omnigent/workflows/` script concept, no `ultracode`-style
+trigger. (Note: the `ucode` / `UcodeAgentState` symbols in the codebase are
+unrelated — that is Databricks workspace config, not Claude's `ultracode`.)
+
+## 2.5. The decisive enabler: Omnigent has a full HTTP/SSE API *and* a client SDK
+
+This reshapes the whole feasibility picture. Omnigent is not just a CLI — it is a
+**server with a documented REST + SSE API** (`openapi.json`, ~10k lines) and a
+**typed Python client SDK** (`sdks/python-client/omnigent_client`). That means
+the "plan-as-code outside the LLM context" primitive does **not** require a
+bespoke new runtime — *it already exists as a programmable surface a deterministic
+script can drive.*
+
+The API surface relevant to orchestration (from `openapi.json`):
+
+- `POST /v1/sessions` — create a session (the unit a sub-agent runs in).
+- `GET /v1/sessions/{id}/child_sessions`, `POST /v1/sessions/{source}/fork` —
+  parent/child trees and forking are first-class.
+- `POST` to a session + `GET /v1/sessions/{id}/stream` (SSE) and
+  `GET /v1/sessions/{id}/items` — drive a turn and read results.
+- `.../resources/files`, `.../resources/environments/{id}/{filesystem,shell,search}`,
+  `.../resources/terminals` — read files, run shell, search inside a session's
+  environment.
+- `.../agent`, `.../switch-agent`, `.../policies`, `.../permissions` — manage the
+  agent, its model/harness, and its governance per session.
+
+The Python SDK (`omnigent_client`) wraps all of this with typed ergonomics:
+
+```python
+from omnigent_client import OmnigentClient, BlockStream, pipe, skip_intermediate_ends
+
+async with OmnigentClient(base_url=SERVER, headers={"Authorization": f"Bearer {TOK}"}) as c:
+    session = c.session(model="some-agent")        # create / drive a session
+    result = await c.query(model="agent", input="…")  # one-shot, returns .text / .files
+    async for block in pipe(BlockStream().stream(session, "…"), skip_intermediate_ends()):
+        ...                                         # stream typed blocks
+```
+
+It supports session create, multi-turn `send`/`query`, SSE streaming as raw
+events *or* semantic blocks, client-side tool handling, and `fork`. There is also
+a `LocalServer` helper for spinning a server up in-process.
+
+**So the user's hypothesis is correct and is the cleanest route to a faithful
+replica:** an orchestrator can author a **deterministic Python program** that
+imports `omnigent_client` (or hits the REST API directly), and that program — not
+an LLM turn loop — creates the sub-agent sessions, fans out turns to them in
+parallel (`asyncio.gather` over many `session.send`/`query` calls), holds every
+intermediate result **in its own variables**, applies branching / cross-review /
+synthesis in plain code, and surfaces only the final answer. That *is* Claude's
+"plan-as-code, state-in-script-variables, runtime executes it" model — built on
+shipping infrastructure rather than a new engine.
+
+### The one piece of real plumbing to verify
+
+A program the orchestrator launches (via its `sys_os_shell` / a terminal, or as a
+standalone process on the host) needs two things to reach the server:
+
+1. **A base URL** for the Omnigent server it belongs to, and
+2. **An auth token / credential** for it.
+
+The host/runner the agent runs on is *already authenticated* to the server
+(that's what `omnigent login` / `omnigent host` establish, with credentials under
+`~/.omnigent`), so the credential exists on the box. The open question is whether
+it is conveniently exposed to the agent's child process (an env var like a
+`OMNIGENT_BASE_URL` + token, or a readable credential file). If not already
+threaded through, exposing a scoped session token to the agent's environment is a
+**small, well-contained plumbing task** — and the natural thing to add to make
+this pattern first-class. The `OmnigentClient` already accepts `headers=` and an
+`httpx.Auth` for exactly this.
 
 ---
 
@@ -118,14 +188,17 @@ workspace config, not Claude's `ultracode`.)
 | Mixed harness/model per worker | ✅ | ✅ | none |
 | Adversarial cross-review pattern | ✅ codified in script | ⚠️ prompt-driven (Polly) | codify in code |
 | Concurrency / total caps | ✅ 16 / 1000 | ⚠️ per-turn policy only | extend policy |
-| **Plan-as-code (state in variables, not context)** | ✅ | ❌ | **net-new** |
-| **Background runtime executing a script** | ✅ | ❌ (loop runs an LLM) | **net-new** |
+| **Plan-as-code (state in variables, not context)** | ✅ | ⚠️ no *feature*, but the HTTP API + `omnigent_client` SDK make it scriptable today | wrap, don't build |
+| **Background runtime executing a script** | ✅ | ⚠️ run the script as a process/task on the host | small |
 | **Resumable run (cached completed agents)** | ✅ | ⚠️ checkpointed loop, no run-graph cache | extend |
-| Saved workflow → `/command` with `args` | ✅ | ⚠️ skills/agents, no script command | net-new |
+| Saved workflow → `/command` with `args` | ✅ | ⚠️ skills/agents, no script command | net-new (thin) |
 | `ultracode` trigger / auto-plan | ✅ | ❌ | optional |
-| Script artifact on disk (readable/editable) | ✅ | ❌ | net-new |
+| Script artifact on disk (readable/editable) | ✅ | ⚠️ a `.py` orchestration script is exactly this | trivial |
 
-So ~half the matrix is already met; the workflow-specific half is the work.
+The crucial correction vs a first reading: the "net-new runtime" rows are **not**
+net-new. Because Omnigent exposes a full HTTP/SSE API *and* a Python client SDK
+(§2.5), the script and its runtime are a **usage pattern over existing
+infrastructure**, not a new engine to build.
 
 ---
 
@@ -142,36 +215,43 @@ orchestrator LLM's context, so it does not scale to hundreds of agents the way a
 real workflow does, and "resumable from cached results" is only as good as the
 checkpointed loop. **Good as a fast proof-of-concept; not a true replica.**
 
-### Approach B — true workflow runtime (faithful; larger)
-Add a first-class, non-LLM orchestration runtime. This is the honest replica.
+### Approach B — script-driven workflow over the existing API/SDK (faithful; the recommended replica)
+This is the honest replica, and §2.5 shows it does **not** require a bespoke
+runtime — it reuses the HTTP API + `omnigent_client`. The orchestrator authors a
+**deterministic Python script** and runs it; the script holds the plan and state.
 
 Sketch, reusing existing pieces:
 
-1. **Workflow spec / artifact.** A script in `.omnigent/workflows/<name>` plus an
-   invocation `args`. To avoid embedding a JS engine, make the script **Python**
-   (Omnigent is Python; `omnigent/tools/_pep723.py` already runs PEP-723
-   scripts) or a small declarative phase DSL (YAML: phases → fan-out spec →
-   join → review). Python is the more direct analog to Claude's JS scripts.
-2. **A workflow SDK exposed to the script** — the script must *not* touch the FS
-   or shell directly (mirror Claude's constraint); it only orchestrates agents:
-   - `spawn(agent, prompt, *, model=None) -> handle`
-   - `gather(handles) -> results` (await many)
-   - `review(diff, contract, *, by="different-vendor") -> verdict`
-   These are thin wrappers over the existing `sys_session_send` / inbox /
-   `sys_session_create` machinery — the plumbing is done; this is an API surface.
-3. **A runtime that executes the script in the background**, holding intermediate
-   results in script variables (the whole point). Run it as a session-scoped task
-   so it survives alongside the conversation; the conversation only receives the
-   final result. Reuse the durable-checkpoint pattern from
-   `runtime/workflow.py` for resume.
+1. **Workflow artifact.** A `.py` script in `.omnigent/workflows/<name>` plus an
+   invocation `args` (read as a global / argv). Python is the direct analog to
+   Claude's JS scripts; Omnigent is Python and `omnigent/tools/_pep723.py`
+   already runs PEP-723 scripts with inline deps. The script *is* the
+   readable/editable/diffable artifact Claude advertises.
+2. **The orchestration SDK already exists: `omnigent_client`.** The script does
+   not need a new API — it creates sessions, sends turns, streams results, and
+   forks via the SDK. A thin convenience wrapper can expose workflow-shaped
+   helpers over it:
+   - `spawn(agent, prompt, *, model=None)` → `client.session(...).send(...)`
+   - `gather(...)` → `asyncio.gather` over many sends (parallel fan-out/join)
+   - `review(diff, contract, *, by="different-vendor")` → spawn a reviewer agent
+   Intermediate results live in the script's variables — exactly the property
+   that keeps them out of any LLM context.
+3. **Execution + credentials.** Run the script as a host process/task the
+   orchestrator launches; thread a scoped server base-URL + token into its
+   environment (the one real plumbing item, §2.5). The conversation receives only
+   the final return value. For background + resumability, run it as a
+   session-scoped task and reuse the durable-checkpoint pattern from
+   `runtime/workflow.py`.
 4. **Caps + governance.** Enforce ≤16 concurrent / 1000 total by generalizing the
    `spawn_bounds` policy from per-turn to per-run, gated through the existing
-   Nessie policy layer so server/agent/session policies still apply.
+   Nessie policy layer so server/agent/session policies still apply. Because
+   session creation goes through the same API, server-side policies already see
+   every spawned agent.
 5. **Invocation + management UI.** A trigger (a `/workflow` command or an
-   `ultracode`-style keyword) and a progress view. Omnigent already streams
-   sub-agent activity to the web UI Subagents panel and the session tree, so a
-   `/workflows`-style progress view is mostly a projection over existing
-   sub-agent state, not new transport.
+   `ultracode`-style keyword) and a progress view. The spawned sessions are
+   ordinary child sessions, so they already appear in the web UI Subagents panel
+   and session tree — a `/workflows` progress view is mostly a projection over
+   existing sub-agent state, not new transport.
 6. **Save / reuse.** A finished run's script saved into `.omnigent/workflows/`
    becomes a re-runnable command — directly analogous to Claude's save flow and
    compatible with Omnigent's existing skill/agent bundle distribution.
@@ -202,18 +282,32 @@ review Polly already performs becomes a first-class, codified workflow step.
 
 ## 6. Recommendation
 
-1. **Now:** ship **Approach A** as a bundled "workflow" orchestrator agent +
-   skill (a Polly fork that codifies fan-out + cross-review and returns a single
-   synthesized answer). Low risk, demonstrates the user-visible behavior, reuses
-   100% existing primitives.
-2. **Next:** build **Approach B** — a real workflow runtime with a Python (or
-   DSL) script, a small orchestration SDK over the existing sub-agent plumbing,
-   per-run caps, background execution, and a saved-workflow `/command`. This is
-   the faithful replica and plays to Omnigent's multi-harness strength.
+The key finding (§2.5): Omnigent already exposes a full HTTP/SSE API **and** a
+typed Python client SDK, so "plan-as-code outside the LLM context" — the one
+property that defines dynamic workflows — is achievable by having the orchestrator
+write a deterministic Python program that drives `omnigent_client`. It is a usage
+pattern over shipping infrastructure, not a new runtime.
+
+1. **Now (proof of concept, hours-to-days):** prove the loop end-to-end with a
+   standalone Python script using `omnigent_client` that creates N child
+   sessions, fans out with `asyncio.gather`, does cross-vendor review in code, and
+   prints one synthesized answer. This validates §2.5 with zero core changes and
+   surfaces the exact credential-threading detail to fix.
+2. **Then (faithful replica, Approach B):** make it first-class — a
+   `.omnigent/workflows/<name>.py` artifact, a thin `spawn`/`gather`/`review`
+   wrapper over `omnigent_client`, scoped server credentials threaded into the
+   orchestrator's environment, per-run `spawn_bounds` caps, background execution,
+   and a saved-workflow `/command`. An `ultracode`-style auto-trigger is optional
+   polish on top.
+3. **Approach A** (a Polly-fork orchestrator agent that codifies fan-out +
+   cross-review purely in prompts) remains a fine *no-code-change* demo of the
+   behavior, but it keeps state in the LLM context, so it is the fallback, not the
+   target.
 
 The fan-out/join substrate, mixed-model workers, cross-vendor review, fan-out
-caps, and a durable loop are all already in the tree. The genuinely new work is
-*plan-as-code executed outside the LLM context* and its management surface.
+caps, a durable loop, **a REST API, and a client SDK** are all already in the
+tree. The genuinely new work shrinks to: a scoped credential for the script,
+a thin workflow wrapper + `/command` surface, and per-run caps.
 
 ---
 
@@ -221,4 +315,4 @@ caps, and a durable loop are all already in the tree. The genuinely new work is
 - Orchestrate subagents at scale with dynamic workflows — <https://code.claude.com/docs/en/workflows>
 - Introducing dynamic workflows in Claude Code — <https://claude.com/blog/introducing-dynamic-workflows-in-claude-code>
 - A harness for every task: dynamic workflows in Claude Code — <https://claude.com/blog/a-harness-for-every-task-dynamic-workflows-in-claude-code>
-- Omnigent in-tree references: `omnigent/tools/builtins/spawn.py`, `omnigent/runtime/workflow.py`, `omnigent/runtime/subagent_block_notifier.py`, `examples/polly/config.yaml`, `docs/AGENT_YAML_SPEC.md`
+- Omnigent in-tree references: `openapi.json` (REST/SSE API), `sdks/python-client/omnigent_client/` + `sdks/README.md` (Python client SDK), `omnigent/server/routes/sessions.py`, `omnigent/tools/builtins/spawn.py`, `omnigent/runtime/workflow.py`, `omnigent/runtime/subagent_block_notifier.py`, `examples/polly/config.yaml`, `docs/AGENT_YAML_SPEC.md`
