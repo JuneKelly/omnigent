@@ -123,9 +123,15 @@ script can drive.*
 
 The API surface relevant to orchestration (from `openapi.json`):
 
-- `POST /v1/sessions` — create a session (the unit a sub-agent runs in).
-- `GET /v1/sessions/{id}/child_sessions`, `POST /v1/sessions/{source}/fork` —
-  parent/child trees and forking are first-class.
+- `POST /v1/sessions` — create a session (the unit a sub-agent runs in). NB: the
+  public create takes an agent bundle + metadata (title/labels/effort/workspace);
+  it does **not** expose a `parent_session_id`. Parenting a session into the
+  orchestrator's tree is done today by the *internal* `sys_session_send` /
+  `sys_session_create` tools, not this endpoint — see the confidence note in §7.
+- `GET /v1/sessions/{id}/child_sessions` (read the sub-agent tree; the SDK's
+  `child_sessions_tree` / `subtree_busy` are built "for an SDK driver") and
+  `POST /v1/sessions/{source}/fork` (deep-copy a session's history into a new
+  one).
 - `POST` to a session + `GET /v1/sessions/{id}/stream` (SSE) and
   `GET /v1/sessions/{id}/items` — drive a turn and read results.
 - `.../resources/files`, `.../resources/environments/{id}/{filesystem,shell,search}`,
@@ -289,10 +295,12 @@ write a deterministic Python program that drives `omnigent_client`. It is a usag
 pattern over shipping infrastructure, not a new runtime.
 
 1. **Now (proof of concept, hours-to-days):** prove the loop end-to-end with a
-   standalone Python script using `omnigent_client` that creates N child
+   standalone Python script using `omnigent_client` that creates N agent
    sessions, fans out with `asyncio.gather`, does cross-vendor review in code, and
    prints one synthesized answer. This validates §2.5 with zero core changes and
-   surfaces the exact credential-threading detail to fix.
+   surfaces the two open items (credential threading, and whether the spawned
+   sessions need to be parented via the internal `sys_session_*` tools to appear
+   in the UI tree).
 2. **Then (faithful replica, Approach B):** make it first-class — a
    `.omnigent/workflows/<name>.py` artifact, a thin `spawn`/`gather`/`review`
    wrapper over `omnigent_client`, scoped server credentials threaded into the
@@ -310,6 +318,40 @@ tree. The genuinely new work shrinks to: a scoped credential for the script,
 a thin workflow wrapper + `/command` surface, and per-run caps.
 
 ---
+
+## 7. Confidence and what remains unverified
+
+This investigation is **static** — based on reading code and docs on this branch.
+**Nothing here was executed** (no live server, no run script). That is the single
+biggest caveat.
+
+**High confidence (read directly):**
+- The HTTP/SSE API and the `omnigent_client` SDK exist and expose session create,
+  send (`post_event`), SSE `stream`, `get`, `list_items`, `interrupt`, `compact`,
+  `fork`, model override, elicitation resolve, and a `child_sessions` tree reader
+  explicitly described as "the queryable rollup an SDK driver needs"
+  (`sdks/python-client/omnigent_client/_sessions.py`).
+- A deterministic program can drive multiple sessions in parallel
+  (`asyncio.gather`) and hold all intermediate state in its own variables — the
+  defining property of dynamic workflows. *This core thesis is the high-confidence
+  part.*
+
+**Medium / low confidence (inference or contradicted by a closer read):**
+- **Parented sub-agents via the public API.** The public `sessions.create()` has
+  **no `parent_session_id`** — it takes an agent bundle + metadata. So a script
+  can create and drive N sessions, but making them appear as nested children in
+  the orchestrator's UI tree is *not* confirmed via the public API; today that is
+  the job of the internal `sys_session_send` / `sys_session_create` tools. This
+  may need those tools or a small API addition.
+- **Credential exposure.** Whether a process the agent launches automatically
+  receives the server base URL + a usable token is unverified (the host is
+  authenticated; convenient exposure to the child process is the open item).
+
+**Calibrated estimate:** ~85% that the core thesis holds (deterministic
+program + existing API/SDK ⇒ parallel agents with state outside the LLM context,
+no new runtime); ~50% on the convenience details (parented tree via public API,
+low-effort credentials). A small executed proof-of-concept against a local
+server would move both to high confidence and is the recommended next step.
 
 ### Sources
 - Orchestrate subagents at scale with dynamic workflows — <https://code.claude.com/docs/en/workflows>
