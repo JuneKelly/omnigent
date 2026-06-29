@@ -1,59 +1,70 @@
-# Replicating Claude "dynamic workflows" in Omnigent — feasibility investigation
+# Replicating Claude "dynamic workflows" in Omnigent — design
 
-Status: investigation / proposal (no code changes)
-Author: investigation spike
-Question asked: *Is it possible to replicate Claude Code's "dynamic workflows" in
-Omnigent?*
+Status: **recommended design** (supersedes the earlier feasibility investigation
+on this branch; that investigation's findings are folded in as evidence below)
+Author: investigation + design spike
+Question asked: *Can we replicate Claude Code's "dynamic workflows" in Omnigent,
+as securely as possible?*
 
-**Short answer: yes — and more cheaply than first expected.** The fan-out of
-parallel agents already exists. The defining property — moving *the plan itself
-into code*, a deterministic orchestration script that holds the loop and
-intermediate results outside any LLM context — initially looks net-new, but
-Omnigent already ships a **full HTTP/SSE API and a typed Python client SDK
-(`omnigent_client`)**. So the orchestration script is a *usage pattern over
-existing infrastructure*, not a new runtime: a deterministic Python program can
-create sub-agent sessions, fan turns out to them in parallel, hold every result
-in its own variables, and return only the final answer. See §2.5 — this is
-exactly the design the user proposed, and it's the recommended path.
+## Summary
+
+**Yes — and the secure design is clearer than the first investigation suggested.**
+
+The heart of the feature is: an **orchestrator agent decides on a complex
+workflow, writes a deterministic program that implements it, and runs that program
+without the agent having to "think through" each step**. The program — not an LLM
+turn loop — creates sub-agent sessions, fans them out in parallel, holds every
+intermediate result in its own variables, and returns only the final answer. The
+sub-agents it spawns appear as children of the orchestrator's session.
+
+The one design decision that makes this both faithful *and* secure is **where the
+program runs**: not as a sandboxed *agent payload* (a `sys_os_shell` child, which
+is deliberately walled off from server credentials — see §5), but as a
+**trusted, runner-side orchestration task** confined to a single capability:
+talking to the local Omnigent session API with a **scoped, short-lived token**, and
+nothing else (no filesystem, no shell, no arbitrary network). That confinement is a
+direct mirror of how Claude constrains its own workflow script — "the script itself
+has no direct filesystem or shell access; only the agents read/write/run" — and it
+is what keeps agent-authored orchestration code from becoming a privilege
+escalation.
+
+Everything else the feature needs already ships: the Python client SDK
+(`omnigent_client`), parallel sub-agent fan-out/join, mixed-vendor workers,
+cross-vendor adversarial review, a crash-durable agent loop, server-side policy and
+caps, and a web-UI sub-agent tree. The genuinely new work is two small primitives
+(a scoped session token, a parent-aware create) plus thin glue.
 
 ---
 
-## 1. What Claude dynamic workflows actually are
+## 1. What Claude dynamic workflows are
 
-Source: <https://code.claude.com/docs/en/workflows> and
+Sources: <https://code.claude.com/docs/en/workflows>,
 <https://claude.com/blog/introducing-dynamic-workflows-in-claude-code>.
 
-A *dynamic workflow* is **a JavaScript script that Claude writes** and a
-background runtime executes, separate from the conversation. The script
-orchestrates [subagents](https://code.claude.com/docs/en/sub-agents) at scale.
+A *dynamic workflow* is **a script Claude writes** and a background runtime
+executes, separate from the conversation. The script orchestrates
+[subagents](https://code.claude.com/docs/en/sub-agents) at scale. The defining
+properties:
 
-Key properties (from the docs):
-
-- **The plan lives in code, not in a context window.** The script holds the
-  loop, the branching, and every intermediate result in script variables.
-  Claude's context only ever sees the final answer. This is the defining
-  difference from subagents / skills / agent teams, where Claude is the
-  orchestrator and decides turn-by-turn what to spawn.
+- **The plan lives in code, not in a context window.** The script holds the loop,
+  the branching, and every intermediate result in script variables. Claude's
+  context only ever sees the final answer. This is the difference from subagents /
+  skills / agent teams, where an LLM is the orchestrator and decides turn-by-turn
+  what to spawn.
 - **Scale:** dozens to hundreds of agents per run. Hard caps: **≤16 concurrent
-  agents** (fewer on low-core machines), **1,000 agents total per run**.
-- **Quality patterns, not just more agents.** Because the orchestration is code,
-  it can codify adversarial cross-review (independent agents review each other's
-  findings before they're reported) or multi-angle drafting + weighing.
-- **Background + resumable.** Runs in the background while the session stays
-  responsive; resumable *within the same session* (completed agents return cached
-  results, the rest run live).
-- **Constraints the runtime enforces:** no mid-run user input (only agent
-  permission prompts can pause it); the script itself has **no direct filesystem
-  or shell access** — only the agents read/write/run; agents always run in
-  `acceptEdits` and inherit the user's tool allowlist.
-- **Invocation:** the `ultracode` keyword in a prompt, `/effort ultracode` (auto
-  for every substantive task), or a saved/bundled command (e.g. `/deep-research`).
-  Saved scripts live in `.claude/workflows/` or `~/.claude/workflows/` and become
-  `/<name>` commands; they read invocation input from a global `args`.
-- **The script is a real artifact:** written to a file under the session dir, so
-  the user can read it, diff it across runs, edit it, and re-launch.
+  agents**, **1,000 agents total per run**.
+- **Quality patterns codified in code:** e.g. adversarial cross-review (independent
+  agents review each other before findings are reported), multi-angle drafting.
+- **Background + resumable** within the same session (completed agents return
+  cached results; the rest run live).
+- **The script has no direct filesystem or shell access** — only the agents
+  read/write/run. Agents run in `acceptEdits` and inherit the user's allowlist.
+  *(This constraint is load-bearing for our security model — see §3.2.)*
+- **Invocation:** a keyword/effort trigger, or a saved command (`/<name>`) that
+  reads its input from a global `args`. The script is a real artifact on disk —
+  readable, diffable, editable, re-launchable.
 
-The docs' own comparison table is the cleanest framing of where this sits:
+The docs' comparison table is the cleanest framing of where this sits:
 
 | | Subagents | Skills | Agent teams | Workflows |
 |---|---|---|---|---|
@@ -62,476 +73,332 @@ The docs' own comparison table is the cleanest framing of where this sits:
 | Where intermediate results live | Context window | Context window | A shared task list | **Script variables** |
 | Scale | A few per turn | Same | A handful | **Dozens–hundreds per run** |
 
+Omnigent's multi-agent story today maps onto the **"agent teams"** column: an LLM
+orchestrator decides turn-by-turn what to spawn, and state lives in its context.
+The target is the **Workflows** column.
+
 ---
 
-## 2. What Omnigent has today
+## 2. The substrate Omnigent already has
 
-Omnigent is a meta-harness. Its multi-agent story maps almost exactly onto the
-**"agent teams"** column above: an **LLM orchestrator decides turn-by-turn** what
-to spawn, and intermediate state lives in its context (plus, in Polly's case, a
-`.polly/registry.json` task list on disk).
+Almost everything a workflow runtime needs is in the tree; only "plan-as-code
+outside an LLM context" is missing as a *feature*.
 
-The substrate that a workflow runtime would build on is already there:
-
-- **Asynchronous, parallel sub-agent dispatch.** `sys_session_send`
-  (`omnigent/tools/builtins/spawn.py`) launches a sub-agent as an independent
-  task and returns a non-blocking handle
-  (`{task_id, kind: "sub_agent", conversation_id, status, …}`, the
-  `_AsyncToolHandle` shape from `omnigent/runtime/workflow.py`). Results
-  auto-deliver over the unified `async_work_complete` topic; the orchestrator
-  collects them via the inbox (`sys_read_inbox`) rather than busy-polling. So
-  *fan-out and join already exist* — they are just driven by an LLM turn loop
-  today.
-- **Programmatic session creation.** `spawn: true` registers
-  `sys_session_create`, letting an agent launch an existing agent by id *or
-  author a custom agent config and launch it via `config_path`* — i.e. agents
-  can mint new agents at runtime.
-- **Mixed harnesses / models per worker.** Each sub-agent picks its own
-  `executor.harness` + `model` (`docs/AGENT_YAML_SPEC.md`). A workflow could
-  route the cheap wide fan-out to a small model and the final review to a strong
-  one — Polly already does this per dispatch via `args.model`.
+- **A typed Python client SDK — `omnigent_client`.** Omnigent is a server with a
+  documented REST + SSE API (`openapi.json`) and a typed client SDK
+  (`sdks/python-client/omnigent_client`). The SDK does session create, multi-turn
+  `send`/`query`, SSE streaming as raw events or semantic blocks, client-side tool
+  handling, `fork`, model override, and a `child_sessions` tree reader described as
+  "the queryable rollup an SDK driver needs" (`_sessions.py:684`, `fork` at `:887`).
+  *This is the API the workflow program calls.*
+- **Parallel sub-agent fan-out / join.** `sys_session_send`
+  (`omnigent/tools/builtins/spawn.py`) launches a sub-agent as an independent task
+  and returns a non-blocking handle; results auto-deliver over the
+  `async_work_complete` topic and are collected via the inbox. Fan-out and join
+  already exist — they are just LLM-driven today.
+- **Programmatic, parented session creation (internally).** The internal
+  `sys_session_create` accepts `parent_conversation_id` and can create an **idle,
+  create-only** child (`spawn.py:540`, `:897`) — the exact "provision but don't
+  drive" split the design relies on.
+- **Mixed harness/model per worker** (`docs/AGENT_YAML_SPEC.md`); Polly already
+  routes per dispatch via `args.model`.
 - **Cross-vendor adversarial review is a worked example.** Polly
-  (`examples/polly/config.yaml`) already implements "implementer's diff reviewed
-  by a *different vendor*" — the exact quality pattern dynamic workflows
-  advertise — but as prompt instructions an LLM follows, not as code.
-- **Fan-out bounds already exist as policy.** Polly caps fan-out with the
-  `spawn_bounds` policy (`max_dispatches_per_turn: 5`,
-  `dispatch_tools: [sys_session_send, sys_session_create]`). This is the natural
-  hook for the workflow caps (16 concurrent / 1000 total).
-- **Crash-durable agent loop.** `omnigent/runtime/workflow.py` is the core agent
-  loop, "all durably checkpointed for crash recovery" — relevant to the
-  resumability requirement.
-- **Parent/child wake + block escalation.** `subagent_block_notifier.py` already
-  handles the messy edge case dynamic workflows call out (an agent blocked on a
-  permission prompt mid-run) by escalating to the parent.
+  (`examples/polly/config.yaml`) implements "implementer's diff reviewed by a
+  *different vendor*" — but as prompt instructions, not code.
+- **Fan-out caps as policy.** Polly's `spawn_bounds`
+  (`max_dispatches_per_turn: 5`) is the natural hook for the 16/1000 caps.
+- **Crash-durable agent loop** (`omnigent/runtime/workflow.py`, "all durably
+  checkpointed for crash recovery") — the foundation for background + resumable.
+- **Sub-agent tree + web UI for free.** The tree is *derived* from two stored
+  fields (`kind == "sub_agent"`, `parent_conversation_id == <orchestrator id>`);
+  `GET /v1/sessions/{id}/child_sessions` is a query over them
+  (`sqlalchemy_store.py:820`). Any session carrying the orchestrator's id as parent
+  appears in the Subagents panel with no extra wiring.
 
-The one thing Omnigent does **not** ship as a feature: a way to express the
-orchestration as **deterministic code that runs outside an LLM context**. Today
-every "orchestrator" is itself an LLM agent (Polly's brain is a `claude-sdk`
-agent). There is no `.omnigent/workflows/` script concept, no `ultracode`-style
-trigger. (Note: the `ucode` / `UcodeAgentState` symbols in the codebase are
-unrelated — that is Databricks workspace config, not Claude's `ultracode`.)
-
-## 2.5. The decisive enabler: Omnigent has a full HTTP/SSE API *and* a client SDK
-
-This reshapes the whole feasibility picture. Omnigent is not just a CLI — it is a
-**server with a documented REST + SSE API** (`openapi.json`, ~10k lines) and a
-**typed Python client SDK** (`sdks/python-client/omnigent_client`). That means
-the "plan-as-code outside the LLM context" primitive does **not** require a
-bespoke new runtime — *it already exists as a programmable surface a deterministic
-script can drive.*
-
-The API surface relevant to orchestration (from `openapi.json`):
-
-- `POST /v1/sessions` — create a session (the unit a sub-agent runs in). NB: the
-  public create takes an agent bundle + metadata (title/labels/effort/workspace);
-  it does **not** expose a `parent_session_id`. Parenting a session into the
-  orchestrator's tree is done today by the *internal* `sys_session_send` /
-  `sys_session_create` tools, not this endpoint — see §7 for the two options
-  (broker vs. a parent-aware create) and §8 for the confidence note.
-- `GET /v1/sessions/{id}/child_sessions` (read the sub-agent tree; the SDK's
-  `child_sessions_tree` / `subtree_busy` are built "for an SDK driver") and
-  `POST /v1/sessions/{source}/fork` (deep-copy a session's history into a new
-  one).
-- `POST` to a session + `GET /v1/sessions/{id}/stream` (SSE) and
-  `GET /v1/sessions/{id}/items` — drive a turn and read results.
-- `.../resources/files`, `.../resources/environments/{id}/{filesystem,shell,search}`,
-  `.../resources/terminals` — read files, run shell, search inside a session's
-  environment.
-- `.../agent`, `.../switch-agent`, `.../policies`, `.../permissions` — manage the
-  agent, its model/harness, and its governance per session.
-
-The Python SDK (`omnigent_client`) wraps all of this with typed ergonomics:
-
-```python
-from omnigent_client import OmnigentClient, BlockStream, pipe, skip_intermediate_ends
-
-async with OmnigentClient(base_url=SERVER, headers={"Authorization": f"Bearer {TOK}"}) as c:
-    session = c.session(model="some-agent")        # create / drive a session
-    result = await c.query(model="agent", input="…")  # one-shot, returns .text / .files
-    async for block in pipe(BlockStream().stream(session, "…"), skip_intermediate_ends()):
-        ...                                         # stream typed blocks
-```
-
-It supports session create, multi-turn `send`/`query`, SSE streaming as raw
-events *or* semantic blocks, client-side tool handling, and `fork`. There is also
-a `LocalServer` helper for spinning a server up in-process.
-
-**So the user's hypothesis is correct and is the cleanest route to a faithful
-replica:** an orchestrator can author a **deterministic Python program** that
-imports `omnigent_client` (or hits the REST API directly), and that program — not
-an LLM turn loop — creates the sub-agent sessions, fans out turns to them in
-parallel (`asyncio.gather` over many `session.send`/`query` calls), holds every
-intermediate result **in its own variables**, applies branching / cross-review /
-synthesis in plain code, and surfaces only the final answer. That *is* Claude's
-"plan-as-code, state-in-script-variables, runtime executes it" model — built on
-shipping infrastructure rather than a new engine.
-
-### The one piece of real plumbing to verify
-
-A program the orchestrator launches (via its `sys_os_shell` / a terminal, or as a
-standalone process on the host) needs two things to reach the server:
-
-1. **A base URL** for the Omnigent server it belongs to, and
-2. **An auth token / credential** for it.
-
-The host/runner the agent runs on is *already authenticated* to the server
-(that's what `omnigent login` / `omnigent host` establish, with credentials under
-`~/.omnigent`), so the credential exists on the box. The open question is whether
-it is conveniently exposed to the agent's child process (an env var like a
-`OMNIGENT_BASE_URL` + token, or a readable credential file). If not already
-threaded through, exposing a scoped session token to the agent's environment is a
-**small, well-contained plumbing task** — and the natural thing to add to make
-this pattern first-class. The `OmnigentClient` already accepts `headers=` and an
-`httpx.Auth` for exactly this.
+The one thing absent as a feature: a way to express the orchestration as
+**deterministic code that runs outside an LLM context**. Today every orchestrator
+is itself an LLM agent. That gap is what §3 fills.
 
 ---
 
-## 3. Gap analysis
+## 3. Recommended architecture
 
-| Capability | Claude workflows | Omnigent today | Gap |
-|---|---|---|---|
-| Parallel sub-agent fan-out / join | ✅ runtime | ✅ `sys_session_send` + inbox | none |
-| Mixed harness/model per worker | ✅ | ✅ | none |
-| Adversarial cross-review pattern | ✅ codified in script | ⚠️ prompt-driven (Polly) | codify in code |
-| Concurrency / total caps | ✅ 16 / 1000 | ⚠️ per-turn policy only | extend policy |
-| **Plan-as-code (state in variables, not context)** | ✅ | ⚠️ no *feature*, but the HTTP API + `omnigent_client` SDK make it scriptable today | wrap, don't build |
-| **Background runtime executing a script** | ✅ | ⚠️ run the script as a process/task on the host | small |
-| **Resumable run (cached completed agents)** | ✅ | ⚠️ checkpointed loop, no run-graph cache | extend |
-| Saved workflow → `/command` with `args` | ✅ | ⚠️ skills/agents, no script command | net-new (thin) |
-| `ultracode` trigger / auto-plan | ✅ | ❌ | optional |
-| Script artifact on disk (readable/editable) | ✅ | ⚠️ a `.py` orchestration script is exactly this | trivial |
+### 3.1 Where the program runs — and why it's the crux
 
-The crucial correction vs a first reading: the "net-new runtime" rows are **not**
-net-new. Because Omnigent exposes a full HTTP/SSE API *and* a Python client SDK
-(§2.5), the script and its runtime are a **usage pattern over existing
-infrastructure**, not a new engine to build.
+Run the workflow program as a **trusted, runner-side orchestration task**, *not* as
+a sandboxed agent payload.
 
----
+The instinct from the first investigation was "the agent launches the script via
+`sys_os_shell` and we thread a token into its environment." §5 shows that path is
+deliberately walled off: the agent's `sys_os_shell` environment is deny-by-default,
+the runner's binding token is *always* stripped, and the on-disk credential file is
+masked by the sandbox. That wall is correct and should stay — it exists precisely to
+stop agent-authored payloads from exfiltrating credentials.
 
-## 4. Feasibility verdict
+So invert it. The program is *orchestration*, not *agent work*. Run it on the
+trusted side of that wall — the same side as `runtime/workflow.py`'s durable loop
+and `_make_auth_token_factory()` — where holding a server credential is legitimate.
+This single choice resolves **both** previously-open problems at once:
 
-**Replicable: yes.** Two viable strategies, from cheapest to most faithful.
+- **Credentials** stop being a hack: trusted-side code is *meant* to hold a server
+  token (§5).
+- **Parenting** stops needing a broker: trusted-side code can create parented
+  children directly (§3.3), so no LLM round-trip is required to mint them.
 
-### Approach A — "Workflow agent" (no new runtime; ~days)
-Ship a bundled orchestrator agent (a Polly variant) whose *skill* is to author a
-plan and fan it out, plus a lightweight Python "plan file" that the agent reads.
-This gets the *behavior* (scale, cross-review, one final answer) without the
-defining property (plan-in-code-outside-context). State still lives in the
-orchestrator LLM's context, so it does not scale to hundreds of agents the way a
-real workflow does, and "resumable from cached results" is only as good as the
-checkpointed loop. **Good as a fast proof-of-concept; not a true replica.**
+### 3.2 The security model (mirrors Claude; arguably tighter)
 
-### Approach B — script-driven workflow over the existing API/SDK (faithful; the recommended replica)
-This is the honest replica, and §2.5 shows it does **not** require a bespoke
-runtime — it reuses the HTTP API + `omnigent_client`. The orchestrator authors a
-**deterministic Python script** and runs it; the script holds the plan and state.
+Trusted-side does **not** mean unconstrained — the program is still
+**agent-authored code**, so it runs in a tightly scoped confinement that mirrors
+Claude's "the script has no FS/shell; only agents act":
 
-Sketch, reusing existing pieces:
+1. **One capability, nothing else.** The program may talk to the **local Omnigent
+   session API and nothing else** — no filesystem, no shell, no arbitrary network
+   egress. Reuse the existing bwrap/seatbelt sandbox machinery with a dedicated
+   *orchestration profile*: network allowlisted to the server only, FS/shell denied.
+2. **A scoped, short-lived token — never the user's full bearer.** The program's
+   credential is scoped to exactly: *create and drive child sessions owned by this
+   user, parented under this one session, subject to the run caps.* It is **not**
+   `_make_auth_token_factory()`'s raw OIDC bearer. Inject it via the existing
+   `credential_proxy` path (§5).
+3. **Server-side policy still applies to every spawn.** Because each create flows
+   through the same authorized API, Nessie policies, cost budgets, and the
+   per-run caps (§4) all keep applying to every agent the program spawns.
 
-1. **Workflow artifact.** A `.py` script in `.omnigent/workflows/<name>` plus an
-   invocation `args` (read as a global / argv). Python is the direct analog to
-   Claude's JS scripts; Omnigent is Python and `omnigent/tools/_pep723.py`
-   already runs PEP-723 scripts with inline deps. The script *is* the
-   readable/editable/diffable artifact Claude advertises.
-2. **The orchestration SDK already exists: `omnigent_client`.** The script does
-   not need a new API — it creates sessions, sends turns, streams results, and
-   forks via the SDK. A thin convenience wrapper can expose workflow-shaped
-   helpers over it:
-   - `spawn(agent, prompt, *, model=None)` → `client.session(...).send(...)`
-   - `gather(...)` → `asyncio.gather` over many sends (parallel fan-out/join)
-   - `review(diff, contract, *, by="different-vendor")` → spawn a reviewer agent
-   Intermediate results live in the script's variables — exactly the property
-   that keeps them out of any LLM context.
-3. **Execution + credentials.** Run the script as a host process/task the
-   orchestrator launches; thread a scoped server base-URL + token into its
-   environment (the one real plumbing item, §2.5). The conversation receives only
-   the final return value. For background + resumability, run it as a
-   session-scoped task and reuse the durable-checkpoint pattern from
-   `runtime/workflow.py`.
-4. **Caps + governance.** Enforce ≤16 concurrent / 1000 total by generalizing the
-   `spawn_bounds` policy from per-turn to per-run, gated through the existing
-   Nessie policy layer so server/agent/session policies still apply. Because
-   session creation goes through the same API, server-side policies already see
-   every spawned agent.
-5. **Invocation + management UI.** A trigger (a `/workflow` command or an
-   `ultracode`-style keyword) and a progress view. The spawned sessions are
-   ordinary child sessions, so they already appear in the web UI Subagents panel
-   and session tree — a `/workflows` progress view is mostly a projection over
-   existing sub-agent state, not new transport.
-6. **Save / reuse.** A finished run's script saved into `.omnigent/workflows/`
-   becomes a re-runnable command — directly analogous to Claude's save flow and
-   compatible with Omnigent's existing skill/agent bundle distribution.
+The blast radius of a malicious or buggy workflow program is therefore bounded to
+"spawn sub-sessions under my own parent, up to the caps" — no privilege escalation,
+no credential theft, no host access. This is **stricter** than Claude's model in one
+respect: the agent-authored orchestration code never holds a general-purpose
+credential at all, only a parent-scoped one.
 
-**Distinct Omnigent advantage:** because Omnigent is multi-harness, a workflow
-here could fan out across *Claude Code, Codex, Cursor, Pi, …* in one run —
-something Claude's own workflows (single vendor) cannot do. The cross-vendor
-review Polly already performs becomes a first-class, codified workflow step.
+> Honest residual risk: we are still *executing agent-authored code*. That is true
+> of Claude's workflows too. The isolation that bounds it is the OS sandbox
+> (network/FS/shell) **plus** the scoped token — not language-level sandboxing
+> (RestrictedPython is fragile; do not rely on it).
 
----
+### 3.3 Parenting — the tree falls out for free
 
-## 5. Risks / open questions
+Children appear under the orchestrator iff they carry its id as
+`parent_conversation_id` with `kind="sub_agent"`; the tree is just a query over
+those fields (`sqlalchemy_store.py:174`, `:820`). Two verified facts shape the
+mechanism (§6): `parent_conversation_id` is set **only at create** and is
+immutable, and the **public** create API has no parent parameter — only the
+internal `sys_session_create` does.
 
-- **Script trust & sandboxing.** A Python orchestration script is code the agent
-  wrote; it must run with the FS/shell denied to the script itself (only agents
-  act), exactly as Claude constrains it. The existing sandbox + policy layers
-  cover the agents, but the *script host* needs its own confinement. A
-  declarative phase DSL sidesteps this entirely at the cost of expressiveness.
-- **Cost blow-up.** Hundreds of agents per run is real spend. Reuse the existing
-  cost policies (`cost_budget`) and surface per-agent token usage as Claude does.
-- **Resumability semantics.** "Cached completed agents" needs a run-graph keyed
-  store; the checkpointed loop is a foundation but not the whole thing.
-- **Concurrency on a single host.** 16 concurrent harness subprocesses is heavy;
-  Omnigent's managed-host / cloud-sandbox story could actually *exceed* Claude's
-  local cap by distributing agents across sandboxes.
+So the design adds a **parent-aware create** the scoped token may call (the earlier
+doc's §7 "Option 2"), wiring straight to the store's existing
+`create_conversation(parent_conversation_id=…)` argument. The server enforces that
+the created session's parent equals the token's scoped parent — scope and
+capability line up exactly, which is what makes this clean. Once the field is
+writable through that path, the spawned sessions appear in the Subagents panel with
+no further work.
+
+### 3.4 End-to-end flow
+
+1. **Decide + author.** The orchestrator (LLM) decides a workflow is warranted,
+   writes a deterministic `workflow.py` against a thin `omnigent_workflow` helper
+   (over `omnigent_client`), and triggers it. *This is the only LLM judgment in the
+   loop — what to decompose and, later, whether the result is good.*
+2. **Launch (trusted-side, sandboxed).** The runner starts `workflow.py` as a
+   session-scoped durable task under the §3.2 orchestration profile, injecting the
+   scoped parent-bound token.
+3. **Run (deterministic).** The program creates parented child sessions, fans out
+   with `asyncio.gather`, holds all intermediate state in its own variables,
+   applies branching / cross-vendor review / synthesis in plain code.
+4. **Children show up live.** They are ordinary parented sub-agents, so the web UI
+   Subagents panel and session tree render the run with no new transport.
+5. **Return one answer.** Only the final value is posted back to the orchestrator's
+   conversation; the intermediate fan-out never enters any LLM context.
+6. **Save / reuse.** The `workflow.py` artifact saved to `.omnigent/workflows/<name>`
+   becomes a re-runnable `/command` reading its input from `args` — directly
+   analogous to Claude's save flow and compatible with bundle distribution.
+
+**Distinct Omnigent advantage:** because Omnigent is multi-harness, one run can fan
+out across *Claude Code, Codex, Cursor, Pi, …* — something Claude's single-vendor
+workflows cannot. The cross-vendor review Polly does in prompts becomes a
+first-class, codified workflow step.
 
 ---
 
-## 6. Recommendation
+## 4. What's new vs. reused
 
-The key finding (§2.5): Omnigent already exposes a full HTTP/SSE API **and** a
-typed Python client SDK, so "plan-as-code outside the LLM context" — the one
-property that defines dynamic workflows — is achievable by having the orchestrator
-write a deterministic Python program that drives `omnigent_client`. It is a usage
-pattern over shipping infrastructure, not a new runtime.
+**Build — two primitives + glue:**
 
-1. **Now (proof of concept, hours-to-days):** prove the loop end-to-end with a
-   standalone Python script using `omnigent_client` that creates N agent
-   sessions, fans out with `asyncio.gather`, does cross-vendor review in code, and
-   prints one synthesized answer. This validates §2.5 with zero core changes and
-   surfaces the two open items (credential threading, and whether the spawned
-   sessions need to be parented via the internal `sys_session_*` tools to appear
-   in the UI tree).
-2. **Then (faithful replica, Approach B):** make it first-class — a
-   `.omnigent/workflows/<name>.py` artifact, a thin `spawn`/`gather`/`review`
-   wrapper over `omnigent_client`, scoped server credentials threaded into the
-   orchestrator's environment, per-run `spawn_bounds` caps, background execution,
-   and a saved-workflow `/command`. An `ultracode`-style auto-trigger is optional
-   polish on top.
-3. **Approach A** (a Polly-fork orchestrator agent that codifies fan-out +
-   cross-review purely in prompts) remains a fine *no-code-change* demo of the
-   behavior, but it keeps state in the LLM context, so it is the fallback, not the
-   target.
+| Item | Notes |
+|---|---|
+| **Scoped session token** | Minted trusted-side; scope = `{user, parent_session_id, caps}`. The security keystone (§3.2). |
+| **Parent-aware create** | New write path honoring the existing `(parent_conversation_id, title)` uniqueness + parent-exists checks; server enforces `parent == token.scope.parent` (§3.3). |
+| Orchestration sandbox profile | A bwrap/seatbelt profile: net→server only, FS/shell denied. Reuses existing sandbox + `credential_proxy`. |
+| `omnigent_workflow` wrapper | Thin `spawn` / `gather` / `review` / `synthesize` over `omnigent_client`. |
+| `/workflow` trigger + launch-as-task | Reuse the durable-task pattern from `runtime/workflow.py`. |
+| Per-**run** caps | Generalize `spawn_bounds` from per-turn to per-run (16 concurrent / 1000 total), gated server-side. |
 
-The fan-out/join substrate, mixed-model workers, cross-vendor review, fan-out
-caps, a durable loop, **a REST API, and a client SDK** are all already in the
-tree. The genuinely new work shrinks to: a scoped credential for the script,
-a thin workflow wrapper + `/command` surface, and per-run caps.
+**Reuse — already in the tree:** `omnigent_client` SDK; fan-out/join; mixed-vendor
+workers; cross-vendor review (Polly); the sandbox + `credential_proxy`; the durable
+loop; server-side policy/cost; the web-UI sub-agent tree.
 
 ---
 
-## 7. Tying child sessions to the orchestrator (parenting): two options
+## 5. Evidence: the credential boundary (why "trusted-side" is mandatory)
 
-A deterministic workflow program (§2.5 / Approach B) can create and drive agent
-sessions today, but those sessions are **top-level** — they do not appear nested
-under the orchestrator in the UI tree. This section documents, in full, the two
-ways to make spawned sessions show up as children of the orchestrator, the
-tradeoffs of each, and a third "don't bother" fallback.
+This section records the investigation that drove §3.1/§3.2. It answers: *does a
+process the agent launches automatically get a usable server base-URL + token?*
 
-### The mechanic that governs all of this
+**A usable token is withheld from agent payloads — deliberately, by three locks:**
 
-The sub-agent tree is **derived purely from two stored fields** on a conversation:
-`kind == "sub_agent"` and `parent_conversation_id == <orchestrator id>`. At create
-time the store sets `kind = "sub_agent" if parent_conversation_id else "default"`
-(`omnigent/stores/conversation_store/sqlalchemy_store.py:174`), and
-`GET /v1/sessions/{id}/child_sessions` is just a query over those two fields. Two
-consequences:
+1. **Deny-by-default env for `sys_os_shell`.** `build_helper_env`
+   (`inner/os_env.py:159`) passes through only `_DEFAULT_ENV_PASSTHROUGH`
+   (`PATH`, `HOME`, locale, `TERM`, the `OMNIGENT` session *marker*) — no
+   credentials. The rationale is stated in-code: otherwise "the helper would just
+   call `sys_os_shell('env')` to enumerate every secret and `curl` it out."
+2. **The runner auth secret is *always* stripped** — both branches, even
+   `sandbox.type: none`: `strip_runner_auth_secrets` removes
+   `RUNNER_AUTH_SECRET_ENV_VARS = {RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR}`
+   (`runner/identity.py:58`). Comment: "the helper runs the agent's tool payload,
+   which must never see the tunnel binding token."
+3. **The on-disk credential is masked.** The user's OIDC bearer lives in
+   `~/.omnigent/auth_tokens.json`; the sandbox tmpfs-masks dot-directories
+   (`~/.aws`, `~/.ssh`, `~/.config/gcloud`, and by the same rule `~/.omnigent`) —
+   `bwrap_sandbox.py:951`. So a sandboxed payload can't read it either.
 
-1. **If** a session carries the orchestrator's id as its `parent_conversation_id`
-   (and `kind="sub_agent"`), it **automatically** appears in the tree. There is no
-   separate "register child" step — the tree is a view over the field.
-2. **`parent_conversation_id` is set only at creation and is immutable
-   thereafter.** The only mutator, `update_conversation`, accepts `title,
-   reasoning_effort, model_override, cost_control_mode_override, harness_override,
-   terminal_launch_args, archived` — **no parent field** — and there is no
-   `reparent` / `set_parent` method. The public `PATCH /v1/sessions/{id}` likewise
-   exposes only `runner_id, reasoning_effort, model_override, archived,
-   external_session_id`. So "adopt an existing top-level session by id" is **not
-   possible** without a code change (this rules out the re-parenting idea explored
-   earlier). A `(parent_conversation_id, title)` unique index and a parent-exists
-   check are enforced at create; any new write path must honor both.
+**But the machinery to do it correctly already exists — for trusted-side code:**
 
-The internal `sys_session_create` / `sys_session_send` tools **do** accept
-`parent_conversation_id`, so they are the one existing way to mint a
-already-parented child. There is also a clean capability split worth naming:
-**`sys_session_create` provisions an idle parented session (no turn started);
-`post_event` / send drives it.** Both options below rely on that split to avoid two
-drivers racing on one child.
+- **A token minter:** `_make_auth_token_factory()` (`runner/_entry.py:271`) mints
+  fresh server bearers (stored OIDC from `omnigent login`, or Databricks OAuth).
+- **A child-process threading precedent:** the policy callback stamps exactly
+  `{server_url, session_id, Bearer token}` into a child process today —
+  `OMNIGENT_POLICY_URL` / `OMNIGENT_SESSION_ID` / `OMNIGENT_POLICY_AUTH="Bearer …"`
+  (`runner/app.py:1135-1145`), and executors export `_OMNIGENT_SERVER_URL` /
+  `_OMNIGENT_SESSION_ID` to harness subprocesses (`cursor_executor.py:413`).
+- **A sanctioned per-spec credential path:** `credential_proxy` / `env_passthrough`
+  gives a confined subprocess *specific* credentials without exposing the parent's
+  full environment.
 
----
-
-### Option 1 — Broker pattern: the orchestrator provisions, the program drives
-
-The program never creates parented children itself. When it needs one, it asks the
-orchestrator (the LLM agent, which *does* hold the `sys_session_create` capability)
-to provision it.
-
-**Mechanism:**
-
-1. Program → `post_event` a request to the **orchestrator** session ("provision
-   parented child sessions for tasks A/B/C; do not drive them").
-2. Orchestrator's LLM calls `sys_session_create` once per child (parented,
-   create-only).
-3. Program reads the new ids back via `GET /v1/sessions/{orchestrator}/items`.
-   Critically, it does **not** parse prose: the `sys_session_create` tool-output is
-   a **structured JSON item** (`{task_id, kind:"sub_agent", agent, title,
-   conversation_id, status, message}` — the `_AsyncToolHandle` shape), so the
-   program extracts `conversation_id` deterministically from the function-call
-   output item.
-4. Program drives each child via public `post_event` + `stream`, holds all state in
-   its own variables, runs the workflow, and posts the final result back.
-
-**The decisive tradeoff — granularity.** Every callback to the orchestrator puts a
-nondeterministic LLM turn on the program's hot path (an LLM is a chat partner, not
-an RPC endpoint: loose timing, may batch/rephrase/do something else first).
-
-- **Front-loaded provisioning (acceptable):** the orchestrator provisions the whole
-  pool (or a phase's worth) in *one* request and returns all ids. LLM involvement
-  is bounded to setup; the program then runs deterministically. Fine for workflows
-  with known or phased fan-out.
-- **Per-spawn callbacks (anti-pattern):** asking the orchestrator to mint a child
-  every time the program fans out re-introduces exactly the LLM-in-the-loop latency
-  and nondeterminism that dynamic workflows exist to remove.
-
-**Why it grates conceptually.** The program is the party that knows *precisely*
-what it wants (a row with `parent_conversation_id = X`, a title, an agent) — it has
-everything. Routing that through the LLM reduces the most precise actor in the
-system to *describing* a mechanical action for a fuzzy actor to perform, then
-reading back to confirm it. It spends the LLM on the one step that contains **zero
-judgment**. The principle this violates: **the LLM belongs on judgment (what to
-spawn, how to decompose, whether a result is good enough); deterministic code
-belongs on mechanics (the create call).** "Create a child parented to X" is pure
-mechanics.
-
-**Pros:** zero core changes; works today; parented tree for free; the
-create/drive split keeps the contract clean (orchestrator creates, never drives).
-
-**Cons:** the orchestrator is a synchronous dependency in the program's path; the
-program must poll-with-timeout on the items API for the ids; reliability is bounded
-by LLM reliability as a provisioner; only sound when provisioning is front-loaded.
-
-**Verdict:** defensible **only** as a zero-core-change interim, and **only** for
-front-loaded provisioning.
+**Conclusion that drove the design:** the first investigation's "expose a token to
+the agent's shell — small plumbing" is the wrong frame. The mechanism is small, but
+the easy path is deliberately walled off, and the only readily-available token is
+the user's *full* bearer. The honest, secure answer is to run the program
+**trusted-side** (where the token factory legitimately lives) and hand it a
+**scoped** token via `credential_proxy` — exactly §3.
 
 ---
 
-### Option 2 — Give the deterministic program the capability directly (recommended target)
+## 6. Parenting mechanics (verified facts)
 
-Make a parented session something the program itself can create, so it never routes
-mechanics through the LLM. This is the principled answer and it is a **small,
-well-scoped change**.
+The store derives the sub-agent tree from `(kind, parent_conversation_id)` and sets
+`kind = "sub_agent" if parent_conversation_id else "default"` at create
+(`sqlalchemy_store.py:174`). Two facts shape §3.3:
 
-**Two equivalent shapes** (pick one):
+- **`parent_conversation_id` is immutable after create.** `update_conversation`
+  (`sqlalchemy_store.py:1780`) accepts only `title, reasoning_effort,
+  model_override, cost_control_mode_override, harness_override,
+  terminal_launch_args, archived` — **no parent field**, and there is no
+  `reparent`. So "adopt an existing top-level session by id" is impossible without a
+  core change.
+- **The public create API has no parent parameter** — `SessionsNamespace.create`
+  (`_sessions.py:338`) takes `bundle, filename, title, labels, reasoning_effort,
+  workspace`. Only the internal `sys_session_create` passes
+  `parent_conversation_id` through to the store's existing
+  `create_conversation(parent_conversation_id=…)` argument.
 
-- **(a) Writable parent on update** — add `parent_conversation_id` to
-  `update_conversation` (and flip `kind` to `"sub_agent"` when it is set), then
-  expose it on `PATCH /v1/sessions/{id}` and the SDK. This also enables true
-  **adoption** of an existing top-level session by id.
-- **(b) Parent on create** — add a `parent_session_id` parameter to the create
-  path (`POST /v1/sessions` + `SessionsNamespace.create`), wiring it straight to
-  the store's existing `create_*_conversation(parent_conversation_id=…)` argument,
-  which already takes it.
-
-**Reuse existing validation.** Both shapes must honor what create already enforces:
-the parent must exist, and `(parent_conversation_id, title)` is unique. That logic
-exists in the store create path and is liftable.
-
-**The tree falls out for free.** Because `child_sessions` is just a query over
-`(kind, parent_conversation_id)`, once the field is writable the spawned (or
-adopted) session appears under the orchestrator with no further work.
-
-**Pros:** the program ties its own shoes — fully deterministic, no LLM round-trip
-for mechanics; clean separation (orchestrator's only job is the genuinely-LLM part:
-deciding to launch the workflow and judging the result); supports unbounded /
-dynamic fan-out; shape (a) also unlocks adoption/re-parenting.
-
-**Cons:** requires a core change (store + route + SDK), though a modest one
-(roughly: one field through `update_conversation`/create, one PATCH/create field,
-one SDK kwarg, plus the lifted validation); must keep the per-spawn cost under the
-same `spawn_bounds`-style caps so a deterministic loop cannot run away.
-
-**Verdict:** the principled, faithful target. Pairs naturally with Approach B.
+The parent-aware create in §3.3 is the minimal honest addition: expose that
+existing store argument on a write path the scoped token may call, reusing the
+parent-exists and `(parent_conversation_id, title)` uniqueness checks already
+enforced at create.
 
 ---
 
-### Option 3 — Don't parent at all (fallback)
+## 7. Phasing
 
-Drive top-level sessions from the program and skip UI nesting. Works today with
-zero changes; the cost is purely cosmetic (no sub-agent tree view, weaker
-observability of a run from the web UI). Reasonable for a v1 proof-of-concept where
-the deliverable is the synthesized result, not the live tree.
-
----
-
-### Comparison
-
-| | Option 1 (broker) | Option 2 (capability) | Option 3 (flat) |
-|---|---|---|---|
-| Core changes | none | small (store+route+SDK) | none |
-| Parented tree (UI) | ✅ | ✅ | ❌ |
-| Fully deterministic run | only if provisioning front-loaded | ✅ | ✅ |
-| Supports unbounded dynamic fan-out | ❌ (LLM bottleneck) | ✅ | ✅ |
-| Enables adoption by id | ❌ | ✅ (shape a) | n/a |
-| LLM used for | judgment **and** spawn mechanics | judgment only | judgment only |
-| Good for | zero-change interim, front-loaded fan-out | the real feature | v1 PoC |
-
-### Recommendation for parenting
-
-Target **Option 2 (a parent-aware create / writable parent)** — it is the clean
-expression of "orchestrator orchestrates, deterministic program runs the workflow,"
-and the tree comes for free. Use **Option 1** only as a no-core-change interim and
-only when provisioning is front-loaded into a single orchestrator request. Use
-**Option 3** for the first proof-of-concept, where the synthesized answer is the
-deliverable and the tree view can wait.
-
-### Items to verify for both options
-
-1. **Owner-creds posting to children.** The program (with the user's token) posting
-   `post_event` to sessions owned by the same user *should* be permitted — the
-   public events route is ownership-gated, not parent-gated — but this was not
-   confirmed against the permission checks in the route code.
-2. **(Option 1 only) Orchestrator reliability as a provisioner.** "Create exactly
-   these N and report ids" needs explicit instructions, and the program should
-   poll-with-timeout on the items API rather than assume instant completion.
+1. **PoC — prove the loop, zero security work (hours–days).** A standalone Python
+   script using `omnigent_client` against a local server: create N sessions (flat /
+   top-level), `asyncio.gather` fan-out, cross-vendor review in code, print one
+   synthesized answer. Validates the SDK thesis end-to-end. (Uses the full bearer
+   and skips parenting — fine for a throwaway local proof.)
+2. **Secure target — the §3 architecture.** Scoped token + parent-aware create +
+   orchestration sandbox profile + `/workflow` command + per-run caps + durable
+   background execution.
 
 ---
 
-## 8. Confidence and what remains unverified
+## 8. Risks / open questions
 
-This investigation is **static** — based on reading code and docs on this branch.
-**Nothing here was executed** (no live server, no run script). That is the single
-biggest caveat.
+- **Executing agent-authored code.** Bounded by the OS sandbox (net/FS/shell) +
+  scoped token, not by language sandboxing. Same risk class as Claude's workflows.
+- **Cost blow-up.** Hundreds of agents is real spend; reuse `cost_budget` and
+  surface per-agent usage.
+- **Resumability semantics.** "Cached completed agents" needs a run-graph-keyed
+  store; the durable checkpointed loop is the foundation but not the whole thing.
+  *Note:* a script running as a host process does **not** automatically inherit the
+  loop's checkpoints — running it as a session-scoped durable task (§3.4 step 2) is
+  what makes background + resume real.
+- **Concurrency on one host.** 16 concurrent harness subprocesses is heavy;
+  Omnigent's managed-host / cloud-sandbox story could distribute agents across
+  sandboxes and *exceed* Claude's local cap.
+- **To verify in the PoC.** (a) owner-token `post_event` to a same-owner child is
+  permitted (the events route is ownership-gated, not parent-gated — read but not
+  executed); (b) the scoped-token mint + `credential_proxy` injection path end to
+  end.
+
+---
+
+## 9. What we discarded, and why nothing essential is lost
+
+The earlier investigation explored several shapes. The recommended design absorbs
+the good ones and drops two:
+
+- **Approach B (script over the SDK)** — *kept as the foundation.* §3 is Approach B
+  with the two vague parts (where it runs, how it authenticates) pinned down.
+- **Parent-aware create (old §7 "Option 2")** — *adopted* as §3.3.
+- **Flat / top-level sessions (old §7 "Option 3")** — *kept* as the §7 PoC only.
+- **Broker pattern (old §7 "Option 1") — discarded.** It had the orchestrator LLM
+  mint each child on the program's behalf, putting a nondeterministic LLM turn on
+  the program's hot path — the exact latency/nondeterminism dynamic workflows exist
+  to remove. The scoped token (§3.2) lets the program tie its own shoes, so the
+  broker is unnecessary. Nothing is lost: it was only ever defensible as a
+  zero-core-change interim.
+- **Re-parenting an existing session by id — discarded as infeasible.**
+  `parent_conversation_id` is immutable (§6); adoption would need a core change we
+  don't need, since the program creates children already parented.
+- **Approach A (prompt-only Polly fork) — demoted to a fallback demo.** It keeps
+  state in the LLM context, so it does not scale to hundreds of agents and is not a
+  faithful replica. Useful only as a no-code-change behavioral demo.
+
+---
+
+## 10. Confidence
+
+This design rests on a **static** read of code on this branch; **nothing was
+executed**. That is the main caveat.
 
 **High confidence (read directly):**
-- The HTTP/SSE API and the `omnigent_client` SDK exist and expose session create,
-  send (`post_event`), SSE `stream`, `get`, `list_items`, `interrupt`, `compact`,
-  `fork`, model override, elicitation resolve, and a `child_sessions` tree reader
-  explicitly described as "the queryable rollup an SDK driver needs"
-  (`sdks/python-client/omnigent_client/_sessions.py`).
-- A deterministic program can drive multiple sessions in parallel
-  (`asyncio.gather`) and hold all intermediate state in its own variables — the
-  defining property of dynamic workflows. *This core thesis is the high-confidence
-  part.*
+- The SDK exposes session create, `send`/`query`, SSE `stream`, `child_sessions`
+  tree, `fork`, model override (`omnigent_client/_sessions.py`).
+- A deterministic program can drive many sessions in parallel and hold all state in
+  its own variables — the defining property. *The core thesis is the
+  high-confidence part.*
+- The credential boundary is real and deliberate (§5): agent payloads are denied
+  server tokens; a token minter and a child-process threading precedent exist on
+  the trusted side. *This is what makes "run it trusted-side" the right call with
+  high confidence, where the first investigation only guessed.*
+- Parenting is a query over `(kind, parent_conversation_id)`, the field is
+  immutable post-create, and only the internal create path sets it (§6).
 
-**Medium / low confidence (inference or contradicted by a closer read):**
-- **Parented sub-agents via the public API.** The public `sessions.create()` has
-  **no `parent_session_id`** — it takes an agent bundle + metadata. So a script
-  can create and drive N sessions, but making them appear as nested children in
-  the orchestrator's UI tree is *not* confirmed via the public API; today that is
-  the job of the internal `sys_session_send` / `sys_session_create` tools. This
-  may need those tools or a small API addition.
-- **Credential exposure.** Whether a process the agent launches automatically
-  receives the server base URL + a usable token is unverified (the host is
-  authenticated; convenient exposure to the child process is the open item).
+**Medium / lower confidence (needs the PoC):**
+- The scoped-token mint + `credential_proxy` injection wired end to end.
+- Parent-aware create exposed on a token-callable write path with `parent == scope`
+  enforcement (design is clear; not built).
+- Owner-token `post_event` to a same-owner child (ownership-gated route, read but
+  not executed).
 
-**Calibrated estimate:** ~85% that the core thesis holds (deterministic
-program + existing API/SDK ⇒ parallel agents with state outside the LLM context,
-no new runtime); ~50% on the convenience details (parented tree via public API,
-low-effort credentials). A small executed proof-of-concept against a local
-server would move both to high confidence and is the recommended next step.
+**Calibrated estimate:** ~90% the core thesis holds (deterministic program +
+existing SDK ⇒ parallel agents with state outside the LLM context, no new runtime);
+~75% that the secure shape lands close to §3 as described (the boundary evidence in
+§5 is the part that moved up from the earlier ~50%). A small executed PoC against a
+local server is the recommended next step and would lift both.
 
 ### Sources
+
 - Orchestrate subagents at scale with dynamic workflows — <https://code.claude.com/docs/en/workflows>
 - Introducing dynamic workflows in Claude Code — <https://claude.com/blog/introducing-dynamic-workflows-in-claude-code>
 - A harness for every task: dynamic workflows in Claude Code — <https://claude.com/blog/a-harness-for-every-task-dynamic-workflows-in-claude-code>
-- Omnigent in-tree references: `openapi.json` (REST/SSE API), `sdks/python-client/omnigent_client/` + `sdks/README.md` (Python client SDK), `omnigent/server/routes/sessions.py`, `omnigent/tools/builtins/spawn.py`, `omnigent/runtime/workflow.py`, `omnigent/runtime/subagent_block_notifier.py`, `examples/polly/config.yaml`, `docs/AGENT_YAML_SPEC.md`
+- Omnigent in-tree references: `openapi.json`; `sdks/python-client/omnigent_client/` (`_sessions.py`); `omnigent/tools/builtins/spawn.py`; `omnigent/runtime/workflow.py`; `omnigent/inner/os_env.py`; `omnigent/runner/identity.py`; `omnigent/runner/_entry.py`; `omnigent/runner/app.py`; `omnigent/inner/bwrap_sandbox.py`; `omnigent/stores/conversation_store/sqlalchemy_store.py`; `examples/polly/config.yaml`; `docs/AGENT_YAML_SPEC.md`
